@@ -1,5 +1,5 @@
 """
-Train a rnn for solving chess puzzles,
+Train a recurrent network for solving chess puzzles,
 based on the paper "Can You Learn an Algorithm? Generalizing from Easy to Hard Problems with Recurrent Networks".
 """
 
@@ -37,7 +37,6 @@ def fen_to_tensor(fen: str) -> torch.Tensor:
 
 
 def uci_move_to_tensor(uci_move: str) -> torch.Tensor: 
-    """Convert UCI move to binary tensor with 1s at from/to squares"""
     move = chess.Move.from_uci(uci_move)
     tensor = torch.zeros(BOARD_SIZE, BOARD_SIZE, dtype=torch.float32)
     from_row, from_col = divmod(move.from_square, BOARD_SIZE)
@@ -66,56 +65,59 @@ class LichessPuzzlesDataset(Dataset):
         return input_tensor, target_tensor
 
 
-class RecurrentBlock(nn.Module):
+class RecurrentResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
+        # 4 layers per block as in the paper
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(channels)
+        self.conv3 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv4 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
 
     def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = F.relu(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out += residual
-        out = F.relu(out)
+        # Residual connections every 2 layers as per paper
+        residual1 = x
+        out = F.relu(self.conv1(x))
+        out = F.relu(self.conv2(out))
+        out = out + residual1  # First residual connection
+        
+        residual2 = out
+        out = F.relu(self.conv3(out))
+        out = F.relu(self.conv4(out))
+        out = out + residual2  # Second residual connection
+        
         return out
 
 
 class RecurrentChessModel(nn.Module):
-    def __init__(self, in_channels=12, recurrent_channels=256, out_channels=1):
+    """
+    Encoder layer (single conv)
+    Shared recurrent residual block (4 conv layers w/ 2 skip connections)
+    Head layers (3 conv layers)
+    """
+    def __init__(self, in_channels=12, hidden_channels=512):
         super().__init__()
-        # encoder: maps input from 12 channels to the recurrent channel dimension
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, recurrent_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(recurrent_channels),
-            nn.ReLU(inplace=True)
-        )
         
-        # single, shared recurrent block
-        self.recurrent_block = RecurrentBlock(recurrent_channels)
+        self.encoder = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False)
         
-        # head: maps from the recurrent channel dimension to the output (single channel for move probability)
+        self.recurrent_block = RecurrentResidualBlock(hidden_channels)
+        
         self.head = nn.Sequential(
-            nn.Conv2d(recurrent_channels, out_channels, kernel_size=1),
-            nn.Sigmoid()  # Output probabilities directly
+            nn.Conv2d(hidden_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 8, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 2, kernel_size=3, padding=1, bias=False)  # 2 channels for binary classification
         )
 
     def forward(self, x, num_iterations):
-        x = self.encoder(x)
+        x = F.relu(self.encoder(x))
         
-        outputs = []
         for _ in range(num_iterations):
             x = self.recurrent_block(x)
-            # We compute the output at each step
-            output = self.head(x)
-            outputs.append(output)
             
-        return outputs
+        output = self.head(x)
+        return output
 
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device, num_iterations, scaler, epoch):
@@ -124,7 +126,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, num_iterati
     progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1} Training", leave=False)
 
     for batch_idx, (inputs, targets) in enumerate(progress_bar):
-        inputs, targets = inputs.to(device), targets.to(device)
+        inputs, targets = inputs.to(device), targets.to(device).long()  # CrossEntropy needs long targets
         
         # Debug
         if epoch == 0 and batch_idx == 0:
@@ -139,20 +141,14 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, num_iterati
         use_amp = scaler is not None
         with torch.cuda.amp.autocast(enabled=use_amp):
             outputs = model(inputs, num_iterations)
-            iteration_losses = []
-            for out in outputs:
-                # Squeeze to remove channel dimension: (B, 1, 8, 8) -> (B, 8, 8)
-                out = out.squeeze(1)
-                loss = criterion(out, targets)
-                iteration_losses.append(loss)
-            loss = torch.stack(iteration_losses).mean()
+            loss = criterion(outputs, targets)
 
         if epoch == 0 and batch_idx < 3:
             with torch.no_grad():
-                first_output = outputs[0].squeeze(1)
+                pred_probs = F.softmax(outputs, dim=1)
                 print(f"Batch {batch_idx}: Loss = {loss.item():.4f}")
-                print(f"  Output mean: {first_output.mean().item():.4f}")
-                print(f"  Target mean: {targets.float().mean().item():.4f}")
+                print(f"  Pred class 0 mean prob: {pred_probs[:, 0].mean().item():.4f}")
+                print(f"  Pred class 1 mean prob: {pred_probs[:, 1].mean().item():.4f}")
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -174,7 +170,11 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, num_iterati
     return total_loss / len(dataloader)
     
 
-def evaluate(model, dataloader, device, max_iterations):
+def evaluate_with_confidence_selection(model, dataloader, device, max_iterations):
+    """
+    Evaluate using confidence-based iteration selection as described in the paper.
+    For each sample, try different numbers of iterations and pick the one with highest confidence.
+    """
     model.eval()
     correct = 0
     total = 0
@@ -183,37 +183,66 @@ def evaluate(model, dataloader, device, max_iterations):
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Evaluating", leave=False)
         for inputs, targets in progress_bar:
-            inputs, targets = inputs.to(device), targets.to(device)
-            
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                all_outputs = model(inputs, max_iterations)
+            inputs, targets = inputs.to(device), targets.to(device).long()
             
             for i in range(inputs.size(0)):
-                # Get outputs for this item across all iterations
-                item_outputs = [out[i].squeeze(0) for out in all_outputs]  # Remove channel dim
-                item_target = targets[i]
+                input_single = inputs[i:i+1]  # Single sample
+                target_single = targets[i]
                 
-                # Find iteration with highest confidence on target positions
-                confidences = []
-                for out in item_outputs:
-                    # Calculate mean prediction on target squares
-                    target_mask = (item_target == 1)
-                    if target_mask.sum() > 0:
-                        confidence = out[target_mask].mean()
-                        confidences.append(confidence.cpu().item())
-                    else:
-                        confidences.append(0.0)
+                best_confidence = -1
+                best_prediction = None
                 
-                best_iter_idx = np.argmax(confidences)
-                best_output = item_outputs[best_iter_idx]
+                for num_iters in range(1, max_iterations + 1):
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        output = model(input_single, num_iters)
+                    
+                    # get probabilities and confidence
+                    probs = F.softmax(output[0], dim=0)  # Remove batch dim
+                    
+                    # find top 2 positions
+                    flat_probs = probs[1].flatten()  # probs for class 1(move squares)
+                    _, top_indices = torch.topk(flat_probs, 2)
+                    
+                    # calculate confidence as mean probability of top 2 squares
+                    confidence = flat_probs[top_indices].mean().item()
+                    
+                    if confidence > best_confidence:
+                        best_confidence = confidence
+                        best_prediction = top_indices
+                
+                true_indices = target_single.flatten().nonzero().flatten()
+                
+                if len(true_indices) == 2 and torch.all(torch.sort(best_prediction)[0] == torch.sort(true_indices)[0]):
+                    correct += 1
+                total += 1
 
-                # Get prediction: find the 2 squares with highest probability
-                _, pred_indices = torch.topk(best_output.flatten(), 2)
+    return correct / total if total > 0 else 0
+
+
+def evaluate_fixed_iterations(model, dataloader, device, num_iterations):
+    model.eval()
+    correct = 0
+    total = 0
+    
+    use_amp = (device.type == 'cuda')
+    with torch.no_grad():
+        progress_bar = tqdm(dataloader, desc="Evaluating", leave=False)
+        for inputs, targets in progress_bar:
+            inputs, targets = inputs.to(device), targets.to(device).long()
+            
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(inputs, num_iterations)
+            
+            probs = F.softmax(outputs, dim=1)
+            move_probs = probs[:, 1]  # Probs for class 1
+            
+            for i in range(inputs.size(0)):
+                # find top 2 squares with highest move probability
+                flat_probs = move_probs[i].flatten()
+                _, pred_indices = torch.topk(flat_probs, 2)
                 
-                # Get true indices
-                true_indices = item_target.flatten().nonzero().flatten()
+                true_indices = targets[i].flatten().nonzero().flatten()
                 
-                # Check if prediction matches target (same 2 squares, order doesn't matter)
                 if len(true_indices) == 2 and torch.all(torch.sort(pred_indices)[0] == torch.sort(true_indices)[0]):
                     correct += 1
                 total += 1
@@ -226,8 +255,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size.")
     parser.add_argument("--learning-rate", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--train-iterations", type=int, default=10, help="Recurrent iterations for training.")
-    parser.add_argument("--eval-iterations", type=int, default=20, help="Max recurrent iterations for evaluation.")
+    parser.add_argument("--train-iterations", type=int, default=20, help="Fixed recurrent iterations for training.")
+    parser.add_argument("--eval-method", type=str, default="confidence", choices=["confidence", "fixed"], 
+                        help="Evaluation method: confidence based selection or fixed iterations")
+    parser.add_argument("--eval-iterations", type=int, default=30, help="Max iterations for confidence eval or fixed iterations.")
     parser.add_argument("--limit-data", type=int, default=None, help="Limit dataset size for quick testing.")
     
     parser.add_argument("--output-dir", type=str, default=".", help="Directory to save the best model.")
@@ -264,25 +295,27 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    # Smaller model with single output channel
-    model = RecurrentChessModel(recurrent_channels=256, out_channels=1).to(device)
+    model = RecurrentChessModel(hidden_channels=512).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model has {total_params:,} parameters")
     
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    effective_depth = 1 + args.train_iterations * 4 + 3  # encoder + (iterations * 4 layers) + head
+    print(f"Effective depth: {effective_depth} layers")
     
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9, weight_decay=2e-4)
     
-    # Use Binary Cross Entropy Loss with class weights
-    pos_weight = torch.tensor([31.0]).to(device)  # Weight for positive class
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100, 110], gamma=0.1)
+    
+    # weighted CrossEntropy
+    class_weights = torch.tensor([1.0, 31.0]).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    print(f"Model init. Starting training for {args.epochs} epochs.")
+    print(f"Model initialized. Starting training for {args.epochs} epochs.")
+    print(f"Architecture: Encoder(1) + Recurrent({args.train_iterations}x4) + Head(3) = {effective_depth} layers")
     print(f"Batch Size: {args.batch_size}, LR: {args.learning_rate}")
-    print(f"Train Iterations: {args.train_iterations}, Eval Iterations: {args.eval_iterations}")
+    print(f"Evaluation method: {args.eval_method}")
 
-    import os
     os.makedirs(args.output_dir, exist_ok=True)
     best_accuracy = 0.0
 
@@ -300,7 +333,10 @@ if __name__ == "__main__":
             model, train_loader, optimizer, criterion, device, args.train_iterations, scaler, epoch
         )
         
-        accuracy = evaluate(model, test_loader, device, args.eval_iterations)
+        if args.eval_method == "confidence":
+            accuracy = evaluate_with_confidence_selection(model, test_loader, device, args.eval_iterations)
+        else:
+            accuracy = evaluate_fixed_iterations(model, test_loader, device, args.eval_iterations)
         
         print(f"Epoch {epoch+1}/{args.epochs} | Avg Train Loss: {avg_train_loss:.4f} | Test Accuracy: {accuracy:.4f}")
 
@@ -316,7 +352,7 @@ if __name__ == "__main__":
             best_accuracy = accuracy
             model_path = os.path.join(args.output_dir, "best_model.pth")
             torch.save(model.state_dict(), model_path)
-            print(f"model saved to {model_path} with accuracy: {accuracy:.4f}")
+            print(f"Model saved to {model_path} with accuracy: {accuracy:.4f}")
             if args.use_wandb:
                 wandb.run.summary["best_accuracy"] = best_accuracy
         
